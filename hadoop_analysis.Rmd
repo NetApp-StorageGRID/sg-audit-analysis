@@ -1,0 +1,171 @@
+---
+title: "Workload Analysis - Hadoop"
+author: "Vishnu Vardhan"
+date: "7/12/2018"
+output: pdf_document
+classoption: landscape
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(ggthemes)
+library(lubridate)
+library(plyr)
+```
+
+
+```{r}
+setwd("/Users/vardhan/Documents/Work/Product/Storage Grid/hadoop/query-98")
+options(digits.secs=6)
+
+hadoop <- read.csv("audit.csv") %>% 
+  mutate (Timestamp = ymd_hms(Timestamp))
+```
+
+## What was tested
+### S3 Operations from a single Hive query
+
+```{r}
+
+atype_list <- c('SHEA' , 'SDEL', 'SPUT' , 'SGET')
+hadoop_parsed <- hadoop %>% filter(ATYP %in% atype_list) %>% 
+  mutate ( S3.OPERATION = factor(case_when(
+    (ATYP=='SHEA' & !is.na(CSIZ))    ~ 'HEAD-O',
+    (ATYP=='SHEA' & is.na(CSIZ)) ~ 'HEAD-B',                                                                           
+    (ATYP=='SDEL' & CSIZ >= 0)    ~ 'DELETE',
+    (ATYP=='SDEL' & is.na(CSIZ)) ~ 'DEL-BUCKET',                                                             
+    (ATYP=='SPUT' & CSIZ >= 0 & !grepl("x-amz-copy-source",HTRH))    ~ 'PUT',
+    (ATYP=='SPUT' & grepl("x-amz-copy-source",HTRH)) ~ 'PUT-COPY',
+    ATYP=='SPUT' & is.na(CSIZ) ~ 'MAKE-BUCKET',
+    (ATYP=='SGET' & CSIZ >= 0)     ~ 'GET',
+    (ATYP=='SGET' & is.na(CSIZ)) ~ 'LIST')))
+
+ops <- hadoop_parsed %>% group_by(S3.OPERATION) %>% dplyr::summarise(count = n(), time = sum(as.numeric(TIME)/1000))
+```
+
+Test Description:
+from: Promise
+
+fs.s3a.multipart.size is now 50MB
+storage: Extrenal to hive
+data set: 100GB
+
+The data is external to hive, hive-bench creates external tables using the s3a connector i.e.
+./tpcds-setup.sh 10 s3a://datalake/
+
+
+```{r}
+
+oldest_s3_op <- hadoop_parsed %>% ungroup() %>% arrange(Timestamp) %>% top_n(-1,Timestamp) %>% select(Timestamp)
+newest_s3_op <- hadoop_parsed %>% ungroup() %>% arrange(Timestamp) %>% top_n(1,Timestamp) %>% select(Timestamp)
+
+
+total_test_time = newest_s3_op[[1,1]] - oldest_s3_op[[1,1]]
+
+print ("Total test time from the first S3 operation to the last: ")
+print (total_test_time )
+
+```
+
+```{r}
+
+hadoop_parsed <- hadoop_parsed %>% mutate ( Time.From.Start = (Timestamp - oldest_s3_op[[1,1]]))
+
+ggplot(data = hadoop_parsed) + 
+  geom_point( mapping = aes(x = as.numeric(Time.From.Start), y = S3.OPERATION, color = S3.OPERATION, alpha = 0.1),
+              position = position_jitter(w = 0, h = 0.05)) +
+  labs(title = "Time when operations happen from the earliest S3 Operation", x = "Time from Start (Secs)", y = "S3 Operation") +
+  theme_bw()
+
+```
+
+\newpage
+```{r}
+ggplot(data = ops) + 
+  geom_col( mapping = aes(x=S3.OPERATION, y = count,  fill = S3.OPERATION)) +
+  labs(title = "Number of S3 Operations", x = "S3 Operation", y = "Count") +
+  theme_bw()
+```
+
+\newpage
+```{r}
+ggplot(data = ops) + 
+  geom_col( mapping = aes(x=S3.OPERATION, y = time,  fill = S3.OPERATION)) +
+  labs(title = "Cumulative time taken by S3 Operations", x = "S3 Operation", y = "Time (milliseconds)") +
+  theme_bw()
+```
+
+\newpage
+```{r}
+
+d_meds <- ddply( hadoop_parsed, .(S3.OPERATION), summarise, med = round(median(TIME/1000)))
+
+ggplot (data = hadoop_parsed) +
+  geom_boxplot( mapping = aes(x = S3.OPERATION, y = TIME/1000, colour = S3.OPERATION)) +
+  geom_text(data = d_meds, aes(x=S3.OPERATION, y=med, label = scales::comma(med)), size = 3) +
+  labs(title = "Latency Profile", y = "Time (milliseconds)", x = "S3 Operation") + 
+  theme_bw() 
+
+rm(d_meds)
+```
+
+\newpage
+```{r}
+d <- hadoop_parsed %>% filter (S3.OPERATION %in% c("PUT", "PUT-COPY", "GET")) %>% filter ( !is.na(CSIZ))
+d_meds <- ddply(d, .(S3.OPERATION), summarise, med = round(median(CSIZ/1000)))
+                                                                          
+ggplot(data = d) + 
+  geom_boxplot( mapping = aes(x = S3.OPERATION, y = CSIZ/1000, color = S3.OPERATION)) +
+  labs(title = "Object Sizes for PUT and GET", x = "S3 Operation", y = "Object Size (KB)") +
+  geom_text(data = d_meds, mapping = aes(x=S3.OPERATION, y = med, label = scales::comma(med)), size = 3) +
+  theme_bw() +
+  scale_y_continuous(labels = scales::comma)
+
+rm(d, d_meds)
+```
+
+
+
+\newpage
+```{r}
+ggplot(data = hadoop_parsed %>% filter (S3.OPERATION %in% c("PUT", "PUT-COPY", "GET")) %>% filter ( !is.na(CSIZ) & CSIZ >= 10000000)) + 
+  geom_histogram( mapping = aes(x = CSIZ/1000, fill = S3.OPERATION)) +
+  labs(title = "Object Size Histogram for objects greater than 10MB", x = "Object Size (KB)", y = "Number of Operations") +
+  theme_bw() +
+  scale_x_continuous(labels = scales::comma)
+
+```
+
+
+\newpage
+```{r}
+ggplot(data = hadoop_parsed %>% filter (S3.OPERATION %in% c("PUT","PUT-COPY", "GET")) %>% filter ( !is.na(CSIZ) & CSIZ >= 100000 & 
+                                                                                          CSIZ < 10000000)) + 
+  geom_histogram( mapping = aes(x = CSIZ/1000, fill = S3.OPERATION)) +
+  labs(title = "Object Size Histogram for objects greater than 100KB, <10MB", x = "Object Size (KB)", y = "Number of Operations") +
+  theme_bw() +
+  scale_x_continuous(labels = scales::comma)
+
+```
+
+
+
+
+\newpage
+```{r}
+ggplot(data = hadoop_parsed %>% filter (S3.OPERATION %in% c("PUT", "PUT-COPY","GET")) %>% filter ( !is.na(CSIZ) & CSIZ < 100000)) + 
+  geom_histogram( mapping = aes(x = CSIZ/1000, fill = S3.OPERATION)) +
+  labs(title = "Object Size Histogram for objects less than 100KB", 
+       x = "Object Size (KB)", y = "Number of Operations") +
+  theme_bw()
+
+```
+
+
+
+
+
